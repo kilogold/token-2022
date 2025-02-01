@@ -3601,6 +3601,141 @@ where
         ));
         self.process_ixs(&instructions, signing_keypairs).await
     }
+
+    /// Transfer tokens confidentially and return the constructed transaction
+    #[allow(clippy::too_many_arguments)]
+    pub async fn confidential_transfer_transfer_tx<S: Signers>(
+        &self,
+        source_account: &Pubkey,
+        destination_account: &Pubkey,
+        source_authority: &Pubkey,
+        equality_proof_account: Option<&ProofAccount>,
+        ciphertext_validity_proof_account_with_ciphertext: Option<&ProofAccountWithCiphertext>,
+        range_proof_account: Option<&ProofAccount>,
+        transfer_amount: u64,
+        account_info: Option<TransferAccountInfo>,
+        source_elgamal_keypair: &ElGamalKeypair,
+        source_aes_key: &AeKey,
+        destination_elgamal_pubkey: &ElGamalPubkey,
+        auditor_elgamal_pubkey: Option<&ElGamalPubkey>,
+        signing_keypairs: &S,
+    ) -> TokenResult<Transaction> {
+        let signing_pubkeys = signing_keypairs.pubkeys();
+        let multisig_signers = self.get_multisig_signers(source_authority, &signing_pubkeys);
+
+        let account_info = if let Some(account_info) = account_info {
+            account_info
+        } else {
+            let account = self.get_account_info(source_account).await?;
+            let confidential_transfer_account = account.get_extension::<ConfidentialTransferAccount>()?;
+            TransferAccountInfo::new(confidential_transfer_account)
+        };
+
+        let (equality_proof_data, ciphertext_validity_proof_data_with_ciphertext, range_proof_data) =
+            if equality_proof_account.is_some()
+                && ciphertext_validity_proof_account_with_ciphertext.is_some()
+                && range_proof_account.is_some()
+            {
+                (None, None, None)
+            } else {
+                let TransferProofData {
+                    equality_proof_data,
+                    ciphertext_validity_proof_data_with_ciphertext,
+                    range_proof_data,
+                } = account_info
+                    .generate_split_transfer_proof_data(
+                        transfer_amount,
+                        source_elgamal_keypair,
+                        source_aes_key,
+                        destination_elgamal_pubkey,
+                        auditor_elgamal_pubkey,
+                    )
+                    .map_err(|_| TokenError::ProofGeneration)?;
+                let equality_proof_data =
+                    equality_proof_account.is_none().then_some(equality_proof_data);
+                let ciphertext_validity_proof_data_with_ciphertext =
+                    ciphertext_validity_proof_account_with_ciphertext.is_none()
+                        .then_some(ciphertext_validity_proof_data_with_ciphertext);
+                let range_proof_data = range_proof_account.is_none().then_some(range_proof_data);
+                (equality_proof_data, ciphertext_validity_proof_data_with_ciphertext, range_proof_data)
+            };
+
+        let (transfer_amount_auditor_ciphertext_lo, transfer_amount_auditor_ciphertext_hi) =
+            if let Some(proof_data_with_ciphertext) = ciphertext_validity_proof_data_with_ciphertext {
+                (
+                    proof_data_with_ciphertext.ciphertext_lo,
+                    proof_data_with_ciphertext.ciphertext_hi,
+                )
+            } else {
+                (
+                    ciphertext_validity_proof_account_with_ciphertext
+                        .unwrap()
+                        .ciphertext_lo,
+                    ciphertext_validity_proof_account_with_ciphertext
+                        .unwrap()
+                        .ciphertext_hi,
+                )
+            };
+
+        let equality_proof_location = Self::confidential_transfer_create_proof_location(
+            equality_proof_data.as_ref(),
+            equality_proof_account,
+            1,
+        )
+        .unwrap();
+        let ciphertext_validity_proof_data =
+            ciphertext_validity_proof_data_with_ciphertext.map(|data| data.proof_data);
+        let ciphertext_validity_proof_location = Self::confidential_transfer_create_proof_location(
+            ciphertext_validity_proof_data.as_ref(),
+            ciphertext_validity_proof_account_with_ciphertext.map(|account| &account.proof_account),
+            2,
+        )
+        .unwrap();
+        let range_proof_location = Self::confidential_transfer_create_proof_location(
+            range_proof_data.as_ref(),
+            range_proof_account,
+            3,
+        )
+        .unwrap();
+
+        let new_decryptable_available_balance = account_info
+            .new_decryptable_available_balance(transfer_amount, source_aes_key)
+            .map_err(|_| TokenError::AccountDecryption)?
+            .into();
+
+        let mut instructions = confidential_transfer::instruction::transfer(
+            &self.program_id,
+            source_account,
+            self.get_address(),
+            destination_account,
+            &new_decryptable_available_balance,
+            &transfer_amount_auditor_ciphertext_lo,
+            &transfer_amount_auditor_ciphertext_hi,
+            source_authority,
+            &multisig_signers,
+            equality_proof_location,
+            ciphertext_validity_proof_location,
+            range_proof_location,
+        )?;
+        offchain::add_extra_account_metas(
+            &mut instructions[0],
+            source_account,
+            self.get_address(),
+            destination_account,
+            source_authority,
+            u64::MAX,
+            |address| {
+                self.client
+                    .get_account(address)
+                    .map_ok(|opt| opt.map(|acc| acc.data))
+            },
+        )
+        .await
+        .map_err(|_| TokenError::AccountNotFound)?;
+
+        // Instead of processing and sending the transactions, just build and return it.
+        self.construct_tx(&instructions, signing_keypairs).await
+    }
 }
 
 /// Calculates the maximum chunk size for a zero-knowledge proof record
